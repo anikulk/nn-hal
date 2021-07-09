@@ -1,0 +1,384 @@
+From b986d447411c66e7daf0ecc56fa621acf8f9e5ce Mon Sep 17 00:00:00 2001
+From: Anisha Kulkarni <anisha.dattatraya.kulkarni@intel.com>
+Date: Fri, 9 Jul 2021 10:42:59 -0700
+Subject: [PATCH] Q LSTM
+
+---
+ BUILD.gn                                      |  5 +-
+ BasePreparedModel.cpp                         | 50 ++++++++---------
+ Driver.cpp                                    | 10 ++--
+ IENetwork.cpp                                 |  6 ++-
+ ModelManager.cpp                              | 12 ++++-
+ ModelManager.h                                | 10 +++-
+ cpu/CpuPreparedModel.cpp                      |  2 +-
+ gna/GnaPreparedModel.cpp                      | 15 ++++--
+ ngraph_creator/include/OperationsFactory.hpp  |  1 +
+ .../operations/include/OperationsBase.hpp     | 54 +++++++++++++++++--
+ ngraph_creator/src/NgraphNetworkCreator.cpp   | 44 +++++++++------
+ ngraph_creator/src/OperationsFactory.cpp      | 10 ++--
+ 12 files changed, 156 insertions(+), 63 deletions(-)
+
+diff --git a/BUILD.gn b/BUILD.gn
+index de9b13f..25e3a91 100755
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -111,6 +111,7 @@ shared_library("intel_nnhal") {
+     "ngraph_creator/operations/src/Pad.cpp",
+     "ngraph_creator/operations/src/Pow.cpp",
+     "ngraph_creator/operations/src/Quantize.cpp",
++    "ngraph_creator/operations/src/QuantizedLSTM.cpp",
+     "ngraph_creator/operations/src/Reduce_All.cpp",
+     "ngraph_creator/operations/src/Reduce_Any.cpp",
+     "ngraph_creator/operations/src/Reduce_Min.cpp",
+@@ -176,11 +177,11 @@ shared_library("intel_nnhal") {
+     "rt",
+     "nnapi-support",
+     "ngraph",
+-    #"inference_engine_legacy",
++    #"inference_engine_legacy",
+     #"inference_engine_c_api",
+     #"inference_engine_preproc",
+     "inference_engine",
+-    "nn-common",
++    "nn-common",
+     "ssl",
+     "crypto"
+   ]
+diff --git a/BasePreparedModel.cpp b/BasePreparedModel.cpp
+index 8f1f64e..92671d3 100755
+--- a/BasePreparedModel.cpp
++++ b/BasePreparedModel.cpp
+@@ -152,15 +152,15 @@ void asyncExecute(const Request& request, MeasureTiming measure, BasePreparedMod
+     }
+     if (measure == MeasureTiming::YES) deviceEnd = now();
+
+-    for (size_t i = 0; i < request.outputs.size(); i++) {
++    for (size_t i = 1; i < request.outputs.size(); i++) {
+         auto outIndex = modelInfo->getModelOutputIndex(i);
+         ALOGI("OutputIndex: %d", outIndex);
+         const std::string& outputNodeName = ngraphNw->getNodeName(outIndex);
+
+@@ -240,23 +240,25 @@ static std::tuple<ErrorStatus, hidl_vec<V1_2::OutputShape>, Timing> executeSynch
+         return {ErrorStatus::GENERAL_FAILURE, {}, kNoTiming};
+     }
+
+-    for (size_t i = 0; i < request.inputs.size(); i++) {
++    for (size_t i = 0; i < 1; i++) {
+         auto inIndex = modelInfo->getModelInputIndex(i);
+         auto srcBlob = modelInfo->getBlobFromMemoryPoolIn(request, i);
+
+         const std::string& inputNodeName = ngraphNw->getNodeName(inIndex);
+
+         auto destBlob = plugin->getBlob(inputNodeName);
+-        uint8_t* dest = destBlob->buffer().as<uint8_t*>();
+-        uint8_t* src = srcBlob->buffer().as<uint8_t*>();
+-        std::memcpy(dest, src, srcBlob->byteSize());
++        ALOGD("Input index: %d layername : %s 2", inIndex, inputNodeName.c_str());
++
++        //uint8_t* dest = destBlob->buffer().as<uint8_t*>();
++        //uint8_t* src = srcBlob->buffer().as<uint8_t*>();
++        //std::memcpy(dest, src, srcBlob->byteSize());
+     }
+
+     if (measure == MeasureTiming::YES) deviceStart = now();
+     try {
+@@ -267,15 +269,15 @@ static std::tuple<ErrorStatus, hidl_vec<V1_2::OutputShape>, Timing> executeSynch
+     }
+     if (measure == MeasureTiming::YES) deviceEnd = now();
+
+-    for (size_t i = 0; i < request.outputs.size(); i++) {
++    for (size_t i = 1; i < request.outputs.size(); i++) {
+         auto outIndex = modelInfo->getModelOutputIndex(i);
+
+         auto srcBlob = plugin->getBlob(outputNodeName);
+         auto operandType = modelInfo->getOperandType(outIndex);
+         uint32_t expectedLength = srcBlob->byteSize();
+@@ -351,10 +353,10 @@ Return<void> BasePreparedModel::executeSynchronously(const Request& request, Mea
+     return Void();
+ }
+
+-Return<void> BasePreparedModel::executeSynchronously_1_3(const V1_3::Request& request,
+-                                         V1_2::MeasureTiming measure,
++Return<void> BasePreparedModel::executeSynchronously_1_3(const V1_3::Request& request,
++                                         V1_2::MeasureTiming measure,
+                                          const V1_3::OptionalTimePoint& deadline,
+-                                          const V1_3::OptionalTimeoutDuration& loopTimeoutDuration,
++                                          const V1_3::OptionalTimeoutDuration& loopTimeoutDuration,
+                                           executeSynchronously_1_3_cb cb){
+     ALOGV("Entering %s", __func__);
+     time_point driverStart;
+@@ -372,8 +374,8 @@ Return<void> BasePreparedModel::executeSynchronously_1_3(const V1_3::Request& re
+ }
+
+ Return<void> BasePreparedModel::configureExecutionBurst(const sp<V1_2::IBurstCallback>& callback,
+-                                                      const MQDescriptorSync<V1_2::FmqRequestDatum>& requestChannel,
+-                                                      const MQDescriptorSync<V1_2::FmqResultDatum>& resultChannel,
++                                                      const MQDescriptorSync<V1_2::FmqRequestDatum>& requestChannel,
++                                                      const MQDescriptorSync<V1_2::FmqResultDatum>& resultChannel,
+                                                       configureExecutionBurst_cb cb) {
+     ALOGV("Entering %s", __func__);
+     const sp<V1_2::IBurstContext> burst =
+@@ -410,7 +412,7 @@ Return<V1_3::ErrorStatus> BasePreparedModel::execute_1_3(const V1_3::Request& re
+ }
+
+ Return<void> BasePreparedModel::executeFenced(const V1_3::Request& request, const hidl_vec<hidl_handle>& waitFor, V1_2::MeasureTiming measure,
+-                               const V1_3::OptionalTimePoint& deadline, const V1_3::OptionalTimeoutDuration& loopTimeoutDuration,
++                               const V1_3::OptionalTimePoint& deadline, const V1_3::OptionalTimeoutDuration& loopTimeoutDuration,
+                                const V1_3::OptionalTimeoutDuration& duration, executeFenced_cb cb){
+     ALOGV("Entering %s", __func__);
+     return Void();
+
+diff --git a/ModelManager.cpp b/ModelManager.cpp
+index a48d501..d6268b1 100755
+--- a/ModelManager.cpp
++++ b/ModelManager.cpp
+@@ -63,10 +63,20 @@ bool NnapiModelInfo::initializeRunTimeOperandInfo() {
+             case OperandType::TENSOR_BOOL8:
+                 to.type = from.type;
+                 break;
+-            case OperandType::TENSOR_QUANT8_ASYMM:
+             case OperandType::TENSOR_QUANT8_SYMM:
+                 to.type = from.type;
++                to.scale = from.scale;
++                break;
++            case OperandType::TENSOR_QUANT8_ASYMM_SIGNED:
++            case OperandType::TENSOR_QUANT8_ASYMM:
++                to.type = from.type;
++                to.scale = from.scale;
++                to.zeroPoint = from.zeroPoint;
+                 break;
++            case OperandType::TENSOR_QUANT16_SYMM:
++                to.type = from.type;
++                break;
++
+             default:
+                 ALOGE("wrong operand type %d", from.type);
+                 return false;
+diff --git a/ModelManager.h b/ModelManager.h
+index 42f16e6..35009ae 100755
+--- a/ModelManager.h
++++ b/ModelManager.h
+@@ -104,6 +104,12 @@ public:
+         return operand.zeroPoint;
+     }
+
++    void getOperandScaleZeroPoint(int index, float& scale, int32_t& zp) {
++        auto operand = getOperand(index);
++        scale = operand.scale;
++        zp = operand.zeroPoint;
++        return;
++    }
+     RunTimeOperandInfo& getRuntimeOperand(uint32_t index) {
+         return mOperands[mModel.main.inputIndexes[index]];
+     }
+@@ -130,8 +136,8 @@ public:
+         uint32_t inputIndex = mModel.main.operations[operationIndex].inputs[index];
+         const auto operand = mModel.main.operands[inputIndex];
+         const auto value = GetConstOperand<T>(inputIndex);
+-        ALOGV("Operation input index: %d, operand index: %d", index, inputIndex);
+-        ALOGV("Operation: %s", toString(mModel.main.operations[operationIndex]).c_str());
++        ALOGV("Operation input index: %d, operand index: %d", index, inputIndex);
++        ALOGV("Operation: %s", toString(mModel.main.operations[operationIndex]).c_str());
+         printHelper<T>::print(value, toString(operand).c_str());
+
+         return value;
+
+diff --git a/gna/GnaPreparedModel.cpp b/gna/GnaPreparedModel.cpp
+index ee0c20c..3cfba0f 100644
+--- a/gna/GnaPreparedModel.cpp
++++ b/gna/GnaPreparedModel.cpp
+@@ -39,11 +39,20 @@ bool GnaPreparedModel::initialize(const Model& model) {
+         ALOGE("%s ngraph generation failed", __func__);
+         return false;
+     }
+-    auto ngraph_net = std::make_shared<InferenceEngine::CNNNetwork>(ngraph_function);
++    try {
++        auto ngraph_net = std::make_shared<InferenceEngine::CNNNetwork>(ngraph_function);
++#if __ANDROID__
+     ngraph_net->serialize("/data/vendor/neuralnetworks/ngraph_ir.xml",
+                           "/data/vendor/neuralnetworks/ngraph_ir.bin");
+-    mPlugin = std::make_shared<IENetwork>(ngraph_net);
+-    mPlugin->loadNetwork();
++#else
++        ngraph_net->serialize("/tmp/ngraph_ir.xml", "/tmp/ngraph_ir.bin");
++#endif
++    	mPlugin = std::make_shared<IENetwork>(ngraph_net);
++    	mPlugin->loadNetwork();
++    } catch (const std::exception& ex) {
++        ALOGE("%s Exception !!! %s", __func__, ex.what());
++        return false;
++    }
+
+     ALOGV("Exiting %s", __func__);
+     return true;
+diff --git a/ngraph_creator/include/OperationsFactory.hpp b/ngraph_creator/include/OperationsFactory.hpp
+index 538906c..2cc38fc 100644
+--- a/ngraph_creator/include/OperationsFactory.hpp
++++ b/ngraph_creator/include/OperationsFactory.hpp
+@@ -37,6 +37,7 @@
+ #include <Pad_V2.hpp>
+ #include <Pow.hpp>
+ #include <Quantize.hpp>
++#include <QuantizedLSTM.hpp>
+ #include <RSQRT.hpp>
+ #include <Reduce_All.hpp>
+ #include <Reduce_Any.hpp>
+diff --git a/ngraph_creator/operations/include/OperationsBase.hpp b/ngraph_creator/operations/include/OperationsBase.hpp
+index dff2b00..ba6e735 100644
+--- a/ngraph_creator/operations/include/OperationsBase.hpp
++++ b/ngraph_creator/operations/include/OperationsBase.hpp
+@@ -37,6 +37,17 @@ protected:
+     const vec<uint32_t> getInputOperandDimensions(uint32_t inputIndex);
+     bool isValidInputTensor(uint32_t inputIndex);
+
++    template<typename T>
++    bool deQuantize(const T* inputData, const uint32_t& len, const float scale,
++                const int32_t zeroPoint, float* outputData) {
++        int32_t value;
++        for (int i = 0; i < len; ++i) {
++            value = *(inputData + i);
++            outputData[i] = static_cast<float>(scale * (value - zeroPoint));
++        }
++    return true;
++    }
++
+     std::shared_ptr<ngraph::Node> getInputNode(uint32_t inputIndex, bool dequantize = true) {
+         std::shared_ptr<ngraph::Node> input;
+         auto operandIndex = sModelInfo->getOperationInput(mNnapiOperationIndex, inputIndex);
+@@ -44,6 +55,8 @@ protected:
+         if (sModelInfo->isOperandLifeTimeConst(operandIndex)) {
+             auto operandDims = getInputOperandDimensions(inputIndex);
+             ngraph::element::Type elementType;
++            float scale;
++            int32_t zp;
+             switch (operandType) {
+                 case OperandType::TENSOR_FLOAT32: {
+                     elementType = ngraph::element::f32;
+@@ -52,9 +65,13 @@ protected:
+                     break;
+                 }
+                 case OperandType::TENSOR_INT32: {
+-                    elementType = ngraph::element::i32;
+-                    auto operandValues = sModelInfo->GetConstVecOperand<int>(operandIndex);
+-                    input = createConstNode(elementType, toNgraphShape(operandDims), operandValues);
++                    elementType = ngraph::element::f32;
++                    sModelInfo->getOperandScaleZeroPoint(operandIndex, scale, zp);
++                    auto operandValues = sModelInfo->GetConstVecOperand<int32_t>(operandIndex);
++                    std::vector<float> f_operandValues;
++                    f_operandValues.resize(operandValues.size());
++                    deQuantize(operandValues.data(), operandValues.size(), scale, zp, f_operandValues.data());
++                    input = createConstNode(elementType, toNgraphShape(operandDims), f_operandValues);
+                     break;
+                 }
+                 case OperandType::TENSOR_BOOL8: {
+@@ -69,12 +86,41 @@ protected:
+                     input = createConstNode(elementType, toNgraphShape(operandDims), operandValues);
+                     break;
+                 }
+-                case OperandType::TENSOR_QUANT8_SYMM: {
++                case OperandType::TENSOR_QUANT8_ASYMM_SIGNED: {
++
++                    sModelInfo->getOperandScaleZeroPoint(operandIndex, scale, zp);
++                    ALOGE("Scale = %f", scale);
++                    ALOGE("zp = %d", zp);
+                     elementType = ngraph::element::i8;
+                     auto operandValues = sModelInfo->GetConstVecOperand<int8_t>(operandIndex);
+                     input = createConstNode(elementType, toNgraphShape(operandDims), operandValues);
+                     break;
+                 }
++                case OperandType::TENSOR_QUANT16_SYMM: {
++                    elementType = ngraph::element::f32;
++                    sModelInfo->getOperandScaleZeroPoint(operandIndex, scale, zp);
++                    auto operandValues = sModelInfo->GetConstVecOperand<int16_t>(operandIndex);
++                    std::vector<float> f_operandValues;
++                    f_operandValues.resize(operandValues.size());
++                    deQuantize(operandValues.data(), operandValues.size(), scale, zp, f_operandValues.data());
++                    input = createConstNode(elementType, toNgraphShape(operandDims), f_operandValues);
++                    break;
++                }
++                case OperandType::TENSOR_QUANT8_SYMM: {
++                    elementType = ngraph::element::f32;
++                    sModelInfo->getOperandScaleZeroPoint(operandIndex, scale, zp);
++                    ALOGE("Scale = %f", scale);
++                    ALOGE("zp = %d", zp);
++
++                    auto operandValues = sModelInfo->GetConstVecOperand<int8_t>(operandIndex);
++                    std::vector<float> f_operandValues;
++                    f_operandValues.resize(operandValues.size());
++                    deQuantize(operandValues.data(), operandValues.size(), scale, zp, f_operandValues.data());
++                    input = createConstNode(elementType, toNgraphShape(operandDims), f_operandValues);
++
++
++                    break;
++                }
+                 default: {
+                     ALOGE("Unsupported Tensor type %s inputIndex %d, operandType %d", __func__,
+                           inputIndex, operandType);
+diff --git a/ngraph_creator/src/NgraphNetworkCreator.cpp b/ngraph_creator/src/NgraphNetworkCreator.cpp
+index 538741a..786736f 100644
+--- a/ngraph_creator/src/NgraphNetworkCreator.cpp
++++ b/ngraph_creator/src/NgraphNetworkCreator.cpp
+
+ bool NgraphNetworkCreator::createInputParams() {
+     for (auto i : mModelInfo->getModelInputIndexes()) {
+         if (dims.size() > 0) {
+@@ -44,33 +44,45 @@ bool NgraphNetworkCreator::createInputParams() {
++                    case OperandType::TENSOR_QUANT8_ASYMM_SIGNED:
++                        inputParam = std::make_shared<ngraph::opset3::Parameter>(
++                            ngraph::element::f32, ngraph::Shape(dims.begin(), dims.end()));
++                        ALOGE("createInputParams FP32 created inputIndex %d, type %d", i,
+                               nnapiOperand.type);
+                         break;
+                     case OperandType::TENSOR_QUANT8_SYMM:
+                         inputParam = std::make_shared<ngraph::opset3::Parameter>(
+                             ngraph::element::i8, ngraph::Shape(dims.begin(), dims.end()));
++                    case OperandType::TENSOR_QUANT16_SYMM:
++                        inputParam = std::make_shared<ngraph::opset3::Parameter>(
++                            ngraph::element::f32, ngraph::Shape(dims.begin(), dims.end()));
++                        ALOGE("createInputParams created inputIndex %d, type %d", i,
+                               nnapiOperand.type);
+                         break;
+                     default:
+@@ -122,23 +134,25 @@ bool NgraphNetworkCreator::initializeModel() {
+             return false;
+         }
+         try {
+-            mOperationNodes[i]->connectOperationToGraph();
++            if ( i == 0) {
++                mOperationNodes[i]->connectOperationToGraph();
++            }
+         } catch (const std::exception& ex) {
+     std::shared_ptr<ngraph::Function> ret;
+     try {
+         if (initializeModel()) ret = mNgraphNodes->generateGraph();
+diff --git a/ngraph_creator/src/OperationsFactory.cpp b/ngraph_creator/src/OperationsFactory.cpp
+index 0e9dc40..ad417a4 100644
+--- a/ngraph_creator/src/OperationsFactory.cpp
++++ b/ngraph_creator/src/OperationsFactory.cpp
+@@ -35,8 +35,8 @@ std::shared_ptr<OperationsBase> OperationsFactory::getOperation(
+             return std::make_shared<Conv_2d>(operationIndex);
+         case OperationType::DEPTHWISE_CONV_2D:
+             return std::make_shared<Depthwise_Conv_2d>(operationIndex);
+-        case OperationType::DEQUANTIZE:
+-            return std::make_shared<Dequantize>(operationIndex);
++        // case OperationType::DEQUANTIZE:
++        //     return std::make_shared<Dequantize>(operationIndex);
+         case OperationType::DIV:
+             return std::make_shared<Div>(operationIndex);
+         case OperationType::EQUAL:
+@@ -89,8 +89,10 @@ std::shared_ptr<OperationsBase> OperationsFactory::getOperation(
+             return std::make_shared<Pad_V2>(operationIndex);
+         case OperationType::POW:
+             return std::make_shared<Pow>(operationIndex);
+-        case OperationType::QUANTIZE:
+-            return std::make_shared<Quantize>(operationIndex);
++        // case OperationType::QUANTIZE:
++        //     return std::make_shared<Quantize>(operationIndex);
++        case OperationType::QUANTIZED_LSTM:
++            return std::make_shared<QuantizedLSTM>(operationIndex);
+         case OperationType::REDUCE_ALL:
+             return std::make_shared<Reduce_All>(operationIndex);
+         case OperationType::REDUCE_ANY:
+--
+2.17.1
+

@@ -37,6 +37,17 @@ protected:
     const vec<uint32_t> getInputOperandDimensions(uint32_t inputIndex);
     bool isValidInputTensor(uint32_t inputIndex);
 
+    template<typename T>
+    bool deQuantize(const T* inputData, const uint32_t& len, const float scale,
+                const int32_t zeroPoint, float* outputData) {
+        int32_t value;
+        for (int i = 0; i < len; ++i) {
+            value = *(inputData + i);
+            outputData[i] = static_cast<float>(scale * (value - zeroPoint));
+        }
+    return true;
+    }
+
     std::shared_ptr<ngraph::Node> getInputNode(uint32_t inputIndex, bool dequantize = true) {
         std::shared_ptr<ngraph::Node> input;
         auto operandIndex = sModelInfo->getOperationInput(mNnapiOperationIndex, inputIndex);
@@ -69,10 +80,36 @@ protected:
                     input = createConstNode(elementType, toNgraphShape(operandDims), operandValues);
                     break;
                 }
-                case OperandType::TENSOR_QUANT8_SYMM: {
+                case OperandType::TENSOR_QUANT8_ASYMM_SIGNED: {
+                    sModelInfo->getOperandScaleZeroPoint(operandIndex, scale, zp);
                     elementType = ngraph::element::i8;
                     auto operandValues = sModelInfo->GetConstVecOperand<int8_t>(operandIndex);
                     input = createConstNode(elementType, toNgraphShape(operandDims), operandValues);
+                    break;
+                }
+                case OperandType::TENSOR_QUANT16_SYMM: {
+                    elementType = ngraph::element::f32;
+                    sModelInfo->getOperandScaleZeroPoint(operandIndex, scale, zp);
+                    auto operandValues = sModelInfo->GetConstVecOperand<int16_t>(operandIndex);
+                    std::vector<float> f_operandValues;
+                    f_operandValues.resize(operandValues.size());
+                    deQuantize(operandValues.data(), operandValues.size(), scale, zp, f_operandValues.data());
+                    input = createConstNode(elementType, toNgraphShape(operandDims), f_operandValues);
+                    break;
+                }
+                case OperandType::TENSOR_QUANT8_SYMM: {
+                    elementType = ngraph::element::f32;
+                    sModelInfo->getOperandScaleZeroPoint(operandIndex, scale, zp);
+                    ALOGE("Scale = %f", scale);
+                    ALOGE("zp = %d", zp);
+
+                    auto operandValues = sModelInfo->GetConstVecOperand<int8_t>(operandIndex);
+                    std::vector<float> f_operandValues;
+                    f_operandValues.resize(operandValues.size());
+                    deQuantize(operandValues.data(), operandValues.size(), scale, zp, f_operandValues.data());
+                    input = createConstNode(elementType, toNgraphShape(operandDims), f_operandValues);
+
+
                     break;
                 }
                 default: {
